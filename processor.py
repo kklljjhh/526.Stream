@@ -1,5 +1,7 @@
 import os
 import tempfile
+import zipfile
+import io
 import xlrd
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -304,10 +306,10 @@ def _process_single_file(file_path, output_path=None):
     return output_path
 
 
-# -------------------------- Web版入口 --------------------------
+# -------------------------- Web版单文件入口 --------------------------
 def process_excel(file_bytes: bytes, file_name: str = "input.xlsx") -> bytes:
     """
-    Web版入口：接收文件bytes，处理，返回结果bytes
+    Web版单文件入口：接收文件bytes，处理，返回结果bytes
     """
     suffix = ".xls" if file_name.lower().endswith(".xls") else ".xlsx"
     
@@ -330,3 +332,40 @@ def process_excel(file_bytes: bytes, file_name: str = "input.xlsx") -> bytes:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
+
+
+# -------------------------- Web版批量入口（新增） --------------------------
+def process_multiple_excel(files: list[tuple[bytes, str]]) -> bytes:
+    """
+    Web版批量入口：接收多个文件，处理，返回 ZIP 文件的 bytes。
+    
+    参数:
+        files: [(file_bytes, file_name), ...] 的列表
+    返回:
+        ZIP 文件 bytes，内含：
+        - 成功文件：原名_处理后.xlsx
+        - 失败日志：原名_处理失败.txt（实时数据或异常时）
+    """
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for file_bytes, file_name in files:
+            base_name = file_name.rsplit(".", 1)[0]
+            
+            try:
+                result_bytes = process_excel(file_bytes, file_name)
+                out_name = f"{base_name}_处理后.xlsx"
+                zf.writestr(out_name, result_bytes)
+                
+            except ValueError as e:
+                # 业务错误（实时数据、格式不对等）
+                log_name = f"{base_name}_处理失败.txt"
+                zf.writestr(log_name, f"{file_name}: {str(e)}\n")
+                
+            except Exception as e:
+                # 其他异常
+                log_name = f"{base_name}_处理失败.txt"
+                zf.writestr(log_name, f"{file_name}: 处理异常：{str(e)}\n")
+    
+    zip_buffer.seek(0)
+    return zip_buffer.read()
