@@ -33,7 +33,7 @@ if uploaded_files:
                 st.download_button(
                     label="📥 下载批量处理结果（ZIP）",
                     data=zip_bytes,
-                    file_name="批量处理结果.zip",
+                    file_name="处理后数据.zip",
                     mime="application/zip"
                 )
         except Exception as e:
