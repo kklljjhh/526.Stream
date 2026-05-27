@@ -1,11 +1,22 @@
 import os
+import sys
+import threading
+import multiprocessing
 import tempfile
-import xlrd
-from openpyxl import Workbook
+import tkinter as tk
+from tkinter import filedialog, ttk
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
+import xlrd
 
 
 # -------------------------- 工具函数 --------------------------
+def select_folder():
+    root = tk.Tk()
+    root.withdraw()
+    return filedialog.askdirectory(title="选择一个文件夹")
+
+
 def read_xls_with_xlrd(file_path):
     """用 xlrd 读取 .xls 文件，返回二维列表（行、列，0-based）"""
     wb = xlrd.open_workbook(file_path)
@@ -27,7 +38,6 @@ def read_xls_with_xlrd(file_path):
 
 def read_xlsx_with_openpyxl(file_path):
     """用 openpyxl 读取 .xlsx 文件，返回二维列表（0-based）"""
-    from openpyxl import load_workbook
     wb = load_workbook(file_path, data_only=True)
     ws = wb.active
     data = []
@@ -37,44 +47,15 @@ def read_xlsx_with_openpyxl(file_path):
     return data
 
 
-# -------------------------- Web版核心处理函数 --------------------------
-def process_excel(file_bytes: bytes, file_name: str = "input.xlsx") -> bytes:
+# -------------------------- 核心处理函数（Web / 桌面共用） --------------------------
+def _process_single_file(file_path, output_path=None):
     """
-    Web版入口：接收文件bytes，处理，返回结果bytes
-    """
-    # 根据后缀创建临时文件
-    suffix = ".xls" if file_name.lower().endswith(".xls") else ".xlsx"
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-    
-    try:
-        result_path = _process_single_file(tmp_path)
-        
-        # 读取结果文件返回bytes
-        with open(result_path, "rb") as f:
-            result_bytes = f.read()
-        
-        # 清理临时文件
-        os.unlink(tmp_path)
-        os.unlink(result_path)
-        
-        return result_bytes
-        
-    except Exception:
-        # 出错也要清理
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-
-def _process_single_file(file_path):
-    """
-    原process_excel逻辑，改为返回输出路径
+    核心处理逻辑，返回输出文件路径。
+    若 output_path 为 None，则默认使用 base + "_处理后.xlsx"
     """
     base, ext = os.path.splitext(file_path)
-    output_path = base + "_处理后.xlsx"
+    if output_path is None:
+        output_path = base + "_处理后.xlsx"
 
     # 1. 读取文件数据
     if ext.lower() == '.xls':
@@ -332,3 +313,143 @@ def _process_single_file(file_path):
     wb.close()
 
     return output_path
+
+
+# -------------------------- Web版入口 --------------------------
+def process_excel(file_bytes: bytes, file_name: str = "input.xlsx") -> bytes:
+    """
+    Web版入口：接收文件bytes，处理，返回结果bytes
+    """
+    suffix = ".xls" if file_name.lower().endswith(".xls") else ".xlsx"
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+    
+    try:
+        result_path = _process_single_file(tmp_path)
+        
+        with open(result_path, "rb") as f:
+            result_bytes = f.read()
+        
+        os.unlink(tmp_path)
+        os.unlink(result_path)
+        
+        return result_bytes
+        
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+# -------------------------- 桌面版入口 --------------------------
+def process_excel_desktop(file_path, progress_queue=None):
+    """
+    桌面版入口：处理单个文件，支持进度队列，输出到"处理后数据"文件夹
+    """
+    base, ext = os.path.splitext(file_path)
+    output_folder = os.path.join(os.path.dirname(file_path), "处理后数据")
+    os.makedirs(output_folder, exist_ok=True)
+    output_path = os.path.join(output_folder, os.path.basename(base) + "_处理后.xlsx")
+
+    try:
+        _process_single_file(file_path, output_path=output_path)
+        if progress_queue:
+            progress_queue.put((os.path.basename(file_path), "完成"))
+        return output_path
+
+    except ValueError as e:
+        err_msg = str(e)
+        if "实时数据" in err_msg:
+            failed_txt = os.path.join(output_folder, f"{os.path.basename(base)}_文件为实时数据_处理失败.txt")
+            with open(failed_txt, "w", encoding="utf-8") as f:
+                f.write(err_msg + "\n")
+            if progress_queue:
+                progress_queue.put((os.path.basename(file_path), "跳过"))
+            return None
+        else:
+            print(f"处理文件 {file_path} 出错：{err_msg}")
+            if progress_queue:
+                progress_queue.put((os.path.basename(file_path), "失败"))
+            return None
+
+    except Exception as e:
+        print(f"处理文件 {file_path} 出错：{e}")
+        if progress_queue:
+            progress_queue.put((os.path.basename(file_path), "失败"))
+        return None
+
+
+# -------------------------- 多进程处理 --------------------------
+def process_files_parallel(folder_path, progress_queue, files):
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+        results = []
+        for fname in files:
+            file_path = os.path.join(folder_path, fname)
+            results.append(pool.apply_async(process_excel_desktop, args=(file_path, progress_queue)))
+        for res in results:
+            res.get()
+
+
+# -------------------------- GUI 主程序 --------------------------
+if __name__ == "__main__":
+    folder_path = select_folder()
+    if not folder_path:
+        sys.exit(0)
+
+    files = [f for f in os.listdir(folder_path)
+             if f.lower().endswith(('.xls', '.xlsx')) and "_处理后" not in f]
+    total = len(files)
+    if total == 0:
+        print("没有找到符合条件的文件！")
+        sys.exit(0)
+
+    manager = multiprocessing.Manager()
+    progress_queue = manager.Queue()
+
+    root = tk.Tk()
+    root.title("文件处理进度")
+    label = tk.Label(root, text="正在初始化...")
+    label.pack(pady=10)
+    progress = ttk.Progressbar(root, orient="horizontal", length=300, mode="determinate")
+    progress.pack(pady=10)
+    progress["maximum"] = total
+
+    completed = 0
+
+    def update_progress():
+        global completed
+        try:
+            while not progress_queue.empty():
+                fname, status = progress_queue.get_nowait()
+                completed += 1
+                progress["value"] = completed
+                label.config(text=f"已处理 {completed}/{total}: {fname} ({status})")
+                root.update()
+        except Exception:
+            pass
+        if completed < total:
+            root.after(200, update_progress)
+        else:
+            label.config(text="所有文件处理完成！")
+            root.update()
+            root.after(2000, lambda: (root.destroy(), os._exit(0)))
+
+    def on_close():
+        print("用户中断，退出...")
+        os._exit(0)
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    def run():
+        try:
+            process_files_parallel(folder_path, progress_queue, files)
+        except Exception as e:
+            print(f"处理异常：{e}")
+        finally:
+            root.after(100, update_progress)
+
+    threading.Thread(target=run, daemon=True).start()
+    root.after(100, update_progress)
+    root.mainloop()
